@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/kelseyhightower/envconfig"
@@ -62,6 +63,29 @@ func main() {
 	if err := Exec(context.Background(), args); err != nil {
 		logrus.Fatalln("Error:", err)
 	}
+}
+
+// getSourceBranchForTag attempts to get the source branch for a tag
+func getSourceBranchForTag(gitPath, tagName string) (string, error) {
+	// Try to get the branch that contains this tag
+	cmd := exec.Command("git", "-C", gitPath, "branch", "-a", "--contains", tagName)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	// Parse branches output
+	branches := strings.Split(string(output), "\n")
+	for _, branch := range branches {
+		branch = strings.TrimSpace(branch)
+		// Remove remote prefix if present
+		branch = strings.TrimPrefix(branch, "remotes/origin/")
+		if branch != "" && !strings.Contains(branch, "HEAD") {
+			return branch, nil
+		}
+	}
+
+	return "", fmt.Errorf("no source branch found for tag %s", tagName)
 }
 
 // Exec contains the main logic for executing commands related to Docker images and JFrog.
@@ -163,20 +187,52 @@ func Exec(ctx context.Context, args Args) error {
 
 	// If Git information is available, add it to the build info
 	logrus.Info("Setting Git Properties")
-	hasVCSInfo := args.RepoURL != "" && args.CommitSha != "" &&
-		(args.BranchName != "" || args.TagName != "")
+	hasVCSInfo := args.RepoURL != "" && args.CommitSha != ""
 
 	if hasVCSInfo {
+		var vcsRef string
+
+		if args.TagName != "" {
+			logrus.Infof("Processing tag build: %s", args.TagName)
+
+			// Try to get source branch
+			sourceBranch, err := getSourceBranchForTag(args.GitPath, args.TagName)
+			if err != nil {
+				logrus.Warnf("Could not determine source branch for tag: %v", err)
+				// If we can't get source branch, use tag name instead
+				vcsRef = fmt.Sprintf("tag: %s", args.TagName)
+			} else {
+				vcsRef = sourceBranch
+				logrus.Infof("Found source branch for tag %s: %s", args.TagName, sourceBranch)
+			}
+
+			// Create or update a file to store VCS reference
+			vcsFile := filepath.Join(args.GitPath, ".git", "vcs_ref")
+			if err := os.WriteFile(vcsFile, []byte(vcsRef), 0644); err != nil {
+				logrus.Warnf("Failed to write VCS reference file: %v", err)
+			}
+
+			// Set git config to help JFrog CLI pick up the correct reference
+			cmd := exec.Command("git", "-C", args.GitPath, "config", "build.vcs.ref", vcsRef)
+			if err := cmd.Run(); err != nil {
+				logrus.Warnf("Failed to set git config for VCS reference: %v", err)
+			}
+		} else if args.BranchName != "" {
+			vcsRef = args.BranchName
+		}
+
 		logrus.WithFields(logrus.Fields{
 			"repo_url":    args.RepoURL,
 			"commit_sha":  args.CommitSha,
 			"branch_name": args.BranchName,
 			"tag_name":    args.TagName,
-		}).Info("Adding VCS information")
+			"vcs_ref":     vcsRef,
+		}).Info("VCS Information")
 
 		cmdArgs = []string{"jfrog", "rt", "build-add-git", args.BuildName, args.BuildNumber, args.GitPath}
 		if err := runCommand(cmdArgs); err != nil {
 			logrus.Warnf("error executing jfrog rt build-add-git command: %v", err)
+			// Continue execution despite git info error
 		}
 	}
 
