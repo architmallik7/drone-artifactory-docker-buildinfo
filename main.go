@@ -172,20 +172,10 @@ func Exec(ctx context.Context, args Args) error {
 			"tag_name":   args.TagName,
 		}).Info("Adding VCS information")
 
-		vcsData := map[string]string{
-			"revision": args.CommitSha,
-			"message":  args.CommitMessage,
+		cmdArgs = []string{"jfrog", "rt", "build-add-git", args.BuildName, args.BuildNumber, args.GitPath}
+		if err := runCommand(cmdArgs); err != nil {
+			logrus.Warnf("error executing jfrog rt build-add-git command: %v", err)
 		}
-
-		if args.BranchName != "" {
-			vcsData["branch"] = args.BranchName
-		}
-		if args.TagName != "" {
-			vcsData["tag"] = args.TagName
-		}
-
-		vcsJSON, _ := json.Marshal(vcsData)
-		logrus.Infof("VCS Data: %s", string(vcsJSON))
 	}
 
 	logrus.Info("Publishing Build Info")
