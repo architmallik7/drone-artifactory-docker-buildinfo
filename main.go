@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"os/exec"
@@ -40,23 +39,6 @@ type Args struct {
 // Artifact represents a Docker image artifact with its SHA256 hash.
 type Artifact struct {
 	Sha256 string `json:"sha256"`
-}
-
-// VCSInfo represents the VCS information in the build info.
-type VCSInfo struct {
-	Revision string `json:"revision"`
-	Message  string `json:"message"`
-	Branch   string `json:"branch"`
-	URL      string `json:"url"`
-}
-
-// BuildInfo represents the JFrog build information structure.
-type BuildInfo struct {
-	Name    string    `json:"name"`
-	Number  string    `json:"number"`
-	Started string    `json:"started"`
-	VCS     []VCSInfo `json:"vcs"`
-	// Other fields omitted for brevity
 }
 
 // Configure logrus to use a custom formatter
@@ -181,40 +163,31 @@ func Exec(ctx context.Context, args Args) error {
 
 	// If Git information is available, add it to the build info
 	logrus.Info("Setting Git Properties")
-
-	// Determine branch or tag to use
-	branchOrTag := args.BranchName
-	if args.TagName != "" {
-		branchOrTag = args.TagName
-		logrus.WithFields(logrus.Fields{
-			"tag_name": args.TagName,
-		}).Info("Using tag as branch name for build info")
-	}
-
 	hasVCSInfo := args.RepoURL != "" && args.CommitSha != "" && (args.BranchName != "" || args.TagName != "")
-
 	if hasVCSInfo {
 		logrus.WithFields(logrus.Fields{
-			"repo_url":      args.RepoURL,
-			"commit_sha":    args.CommitSha,
-			"branch_or_tag": branchOrTag,
+			"repo_url":   args.RepoURL,
+			"commit_sha": args.CommitSha,
+			"branch":     args.BranchName,
+			"tag_name":   args.TagName,
 		}).Info("Adding VCS information")
 
-		// First run the standard git information command
-		cmdArgs = []string{"jfrog", "rt", "build-add-git", args.BuildName, args.BuildNumber, args.GitPath}
-		if err := runCommand(cmdArgs); err != nil {
-			logrus.Warnf("error executing jfrog rt build-add-git command: %v", err)
+		vcsData := map[string]string{
+			"revision": args.CommitSha,
+			"message":  args.CommitMessage,
 		}
 
-		// Now manually update the build info by downloading it, modifying it, and uploading it back
-		if args.TagName != "" {
-			if err := updateBuildInfoWithTag(args, sanitizedURL, branchOrTag); err != nil {
-				logrus.Warnf("error updating build info with tag: %v", err)
-			}
+		if args.BranchName != "" {
+			vcsData["branch"] = args.BranchName
 		}
+		if args.TagName != "" {
+			vcsData["tag"] = args.TagName
+		}
+
+		vcsJSON, _ := json.Marshal(vcsData)
+		logrus.Infof("VCS Data: %s", string(vcsJSON))
 	}
 
-	// Command to publish the build information to JFrog
 	logrus.Info("Publishing Build Info")
 	cmdArgs = []string{"jfrog", "rt", "build-publish", "--build-url=" + args.BuildURL, "--url=" + sanitizedURL, args.BuildName, args.BuildNumber}
 	cmdArgs, err = setAuthParams(cmdArgs, args)
@@ -222,119 +195,8 @@ func Exec(ctx context.Context, args Args) error {
 		logrus.Errorf("error setting auth parameters: %v", err)
 	}
 
-	// Execute the build publish command
 	if err := runCommand(cmdArgs); err != nil {
 		logrus.Fatalln("error executing jfrog rt build-publish command:", err)
-	}
-
-	return nil
-}
-
-func updateBuildInfoWithTag(args Args, url, tagName string) error {
-	// Download the build info using the build-export command instead of build-publish dry-run
-	buildInfoFile := "build-info.json"
-
-	// Command to export the build info
-	cmdArgs := []string{"jfrog", "rt", "build-export", args.BuildName, args.BuildNumber, "--output=" + buildInfoFile, "--url=" + url}
-	cmdArgs, err := setAuthParams(cmdArgs, args)
-	if err != nil {
-		return fmt.Errorf("error setting auth parameters: %v", err)
-	}
-
-	// Run the export command
-	if err := runCommand(cmdArgs); err != nil {
-		return fmt.Errorf("error exporting build info: %v", err)
-	}
-
-	// Read the exported build info file
-	fileContent, err := ioutil.ReadFile(buildInfoFile)
-	if err != nil {
-		return fmt.Errorf("error reading build info file: %v", err)
-	}
-
-	// Parse the JSON into a map to handle unknown structure
-	var buildInfoMap map[string]interface{}
-	if err := json.Unmarshal(fileContent, &buildInfoMap); err != nil {
-		return fmt.Errorf("error parsing build info JSON: %v", err)
-	}
-
-	// Check if buildInfo and vcs fields exist
-	buildInfoObj, exists := buildInfoMap["buildInfo"]
-	if !exists {
-		return fmt.Errorf("buildInfo field not found in JSON")
-	}
-
-	buildInfoData, ok := buildInfoObj.(map[string]interface{})
-	if !ok {
-		return fmt.Errorf("buildInfo is not an object")
-	}
-
-	// Access and update the vcs array if it exists
-	vcsArray, exists := buildInfoData["vcs"]
-	if exists {
-		vcsData, ok := vcsArray.([]interface{})
-		if ok {
-			// Update branch field in each vcs entry
-			for i, vcs := range vcsData {
-				vcsMap, ok := vcs.(map[string]interface{})
-				if ok {
-					vcsMap["branch"] = tagName
-					// Also ensure url and revision are set if they exist in args
-					if args.RepoURL != "" {
-						vcsMap["url"] = args.RepoURL
-					}
-					if args.CommitSha != "" {
-						vcsMap["revision"] = args.CommitSha
-					}
-					if args.CommitMessage != "" {
-						vcsMap["message"] = args.CommitMessage
-					}
-					vcsData[i] = vcsMap
-				}
-			}
-			buildInfoData["vcs"] = vcsData
-		} else {
-			// If vcs exists but is not an array, create a new vcs array
-			buildInfoData["vcs"] = []interface{}{
-				map[string]interface{}{
-					"url":      args.RepoURL,
-					"revision": args.CommitSha,
-					"branch":   tagName,
-					"message":  args.CommitMessage,
-				},
-			}
-		}
-	} else {
-		// If vcs doesn't exist, create it
-		buildInfoData["vcs"] = []interface{}{
-			map[string]interface{}{
-				"url":      args.RepoURL,
-				"revision": args.CommitSha,
-				"branch":   tagName,
-				"message":  args.CommitMessage,
-			},
-		}
-	}
-
-	// Write the modified buildInfo back to the file
-	updatedContent, err := json.MarshalIndent(buildInfoMap, "", "  ")
-	if err != nil {
-		return fmt.Errorf("error marshaling updated build info: %v", err)
-	}
-
-	if err := ioutil.WriteFile(buildInfoFile, updatedContent, 0644); err != nil {
-		return fmt.Errorf("error writing updated build info to file: %v", err)
-	}
-
-	// Import the updated build info
-	cmdArgs = []string{"jfrog", "rt", "build-import", buildInfoFile, "--url=" + url}
-	cmdArgs, err = setAuthParams(cmdArgs, args)
-	if err != nil {
-		return fmt.Errorf("error setting auth parameters: %v", err)
-	}
-
-	if err := runCommand(cmdArgs); err != nil {
-		return fmt.Errorf("error importing updated build info: %v", err)
 	}
 
 	return nil
