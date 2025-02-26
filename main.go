@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net/url"
 	"os"
 	"os/exec"
@@ -39,6 +40,23 @@ type Args struct {
 // Artifact represents a Docker image artifact with its SHA256 hash.
 type Artifact struct {
 	Sha256 string `json:"sha256"`
+}
+
+// VCSInfo represents the VCS information in the build info.
+type VCSInfo struct {
+	Revision string `json:"revision"`
+	Message  string `json:"message"`
+	Branch   string `json:"branch"`
+	URL      string `json:"url"`
+}
+
+// BuildInfo represents the JFrog build information structure.
+type BuildInfo struct {
+	Name    string    `json:"name"`
+	Number  string    `json:"number"`
+	Started string    `json:"started"`
+	VCS     []VCSInfo `json:"vcs"`
+	// Other fields omitted for brevity
 }
 
 // Configure logrus to use a custom formatter
@@ -164,17 +182,16 @@ func Exec(ctx context.Context, args Args) error {
 	// If Git information is available, add it to the build info
 	logrus.Info("Setting Git Properties")
 
-	// For tag builds, set DRONE_BRANCH to the tag value
+	// Determine branch or tag to use
 	branchOrTag := args.BranchName
 	if args.TagName != "" {
-		// If this is a tag build, use the tag name as the branch name
 		branchOrTag = args.TagName
 		logrus.WithFields(logrus.Fields{
 			"tag_name": args.TagName,
 		}).Info("Using tag as branch name for build info")
 	}
 
-	hasVCSInfo := args.RepoURL != "" && args.CommitSha != "" && (branchOrTag != "")
+	hasVCSInfo := args.RepoURL != "" && args.CommitSha != "" && (args.BranchName != "" || args.TagName != "")
 
 	if hasVCSInfo {
 		logrus.WithFields(logrus.Fields{
@@ -183,19 +200,17 @@ func Exec(ctx context.Context, args Args) error {
 			"branch_or_tag": branchOrTag,
 		}).Info("Adding VCS information")
 
-		// Set environment variable for the git command
-		if args.TagName != "" {
-			os.Setenv("DRONE_REPO_BRANCH", args.TagName)
-		}
-
+		// First run the standard git information command
 		cmdArgs = []string{"jfrog", "rt", "build-add-git", args.BuildName, args.BuildNumber, args.GitPath}
 		if err := runCommand(cmdArgs); err != nil {
 			logrus.Warnf("error executing jfrog rt build-add-git command: %v", err)
 		}
 
-		// Restore original branch name if needed
+		// Now manually update the build info by downloading it, modifying it, and uploading it back
 		if args.TagName != "" {
-			os.Setenv("DRONE_REPO_BRANCH", args.BranchName)
+			if err := updateBuildInfoWithTag(args, sanitizedURL, branchOrTag); err != nil {
+				logrus.Warnf("error updating build info with tag: %v", err)
+			}
 		}
 	}
 
@@ -210,6 +225,87 @@ func Exec(ctx context.Context, args Args) error {
 	// Execute the build publish command
 	if err := runCommand(cmdArgs); err != nil {
 		logrus.Fatalln("error executing jfrog rt build-publish command:", err)
+	}
+
+	return nil
+}
+
+// updateBuildInfoWithTag downloads the build info, updates the branch field with the tag name, and uploads it back.
+func updateBuildInfoWithTag(args Args, url, tagName string) error {
+	// Download the build info
+	tempFile, err := ioutil.TempFile("", "build-info-*.json")
+	if err != nil {
+		return fmt.Errorf("error creating temp file: %v", err)
+	}
+	defer os.Remove(tempFile.Name())
+	defer tempFile.Close()
+
+	// Command to download the build info
+	cmdArgs := []string{"jfrog", "rt", "build-publish", "--dry-run=true", "--url=" + url, args.BuildName, args.BuildNumber}
+	cmdArgs, err = setAuthParams(cmdArgs, args)
+	if err != nil {
+		return fmt.Errorf("error setting auth parameters: %v", err)
+	}
+
+	// Run the command and capture the output to a file
+	output, err := runCommandAndCaptureOutput(cmdArgs)
+	if err != nil {
+		return fmt.Errorf("error downloading build info: %v", err)
+	}
+
+	// Write the output to a file
+	if _, err := tempFile.WriteString(output); err != nil {
+		return fmt.Errorf("error writing build info to file: %v", err)
+	}
+	tempFile.Close()
+
+	// Read the file back
+	fileContent, err := ioutil.ReadFile(tempFile.Name())
+	if err != nil {
+		return fmt.Errorf("error reading build info file: %v", err)
+	}
+
+	// Find and modify the JSON content
+	var buildInfo BuildInfo
+	if err := json.Unmarshal(fileContent, &buildInfo); err != nil {
+		return fmt.Errorf("error parsing build info JSON: %v", err)
+	}
+
+	// Update the branch field in VCS info
+	for i := range buildInfo.VCS {
+		buildInfo.VCS[i].Branch = tagName
+	}
+
+	// Write the modified JSON back to the file
+	updatedContent, err := json.MarshalIndent(buildInfo, "", "  ")
+	if err != nil {
+		return fmt.Errorf("error marshaling updated build info: %v", err)
+	}
+
+	if err := ioutil.WriteFile(tempFile.Name(), updatedContent, 0644); err != nil {
+		return fmt.Errorf("error writing updated build info to file: %v", err)
+	}
+
+	// Create a dedicated file for the build info since JFrog CLI expects a real file
+	buildInfoFile, err := os.Create("build-info.json")
+	if err != nil {
+		return fmt.Errorf("error creating build-info.json file: %v", err)
+	}
+	defer buildInfoFile.Close()
+
+	if _, err := buildInfoFile.Write(updatedContent); err != nil {
+		return fmt.Errorf("error writing to build-info.json file: %v", err)
+	}
+
+	// Import the updated build info
+	cmdArgs = []string{"jfrog", "rt", "build-import", "build-info.json", "--url=" + url}
+	cmdArgs, err = setAuthParams(cmdArgs, args)
+	if err != nil {
+		return fmt.Errorf("error setting auth parameters: %v", err)
+	}
+
+	if err := runCommand(cmdArgs); err != nil {
+		return fmt.Errorf("error importing updated build info: %v", err)
 	}
 
 	return nil
