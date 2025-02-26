@@ -165,10 +165,15 @@ func Exec(ctx context.Context, args Args) error {
 	logrus.Info("Setting Git Properties")
 	hasVCSInfo := args.RepoURL != "" && args.CommitSha != "" && (args.BranchName != "" || args.TagName != "")
 	if hasVCSInfo {
+		branchValue := args.BranchName
+		if args.TagName != "" {
+			branchValue = args.TagName
+		}
+
 		logrus.WithFields(logrus.Fields{
 			"repo_url":   args.RepoURL,
 			"commit_sha": args.CommitSha,
-			"branch":     args.BranchName,
+			"branch":     branchValue,
 			"tag_name":   args.TagName,
 		}).Info("Adding VCS information")
 
