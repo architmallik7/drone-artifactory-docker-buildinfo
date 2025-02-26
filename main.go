@@ -7,7 +7,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 
 	"github.com/kelseyhightower/envconfig"
@@ -63,95 +62,6 @@ func main() {
 	if err := Exec(context.Background(), args); err != nil {
 		logrus.Fatalln("Error:", err)
 	}
-}
-
-// getSourceBranchForTag attempts to get the source branch for a tag using multiple methods
-func getSourceBranchForTag(gitPath, tagName string) (string, error) {
-	// Method 1: Try to get the branch that contains this tag
-	logrus.Info("Attempting to find source branch by checking branches containing the tag")
-	cmd := exec.Command("git", "-C", gitPath, "branch", "-a", "--contains", tagName)
-	output, err := cmd.Output()
-	if err == nil {
-		// Parse branches output
-		branches := strings.Split(string(output), "\n")
-		for _, branch := range branches {
-			branch = strings.TrimSpace(branch)
-			// Skip detached HEAD entries
-			if strings.Contains(branch, "HEAD detached") {
-				continue
-			}
-			// Remove asterisk for current branch
-			if strings.HasPrefix(branch, "* ") {
-				branch = branch[2:]
-			}
-			// Remove remote prefix if present
-			if strings.HasPrefix(branch, "remotes/origin/") {
-				branch = strings.TrimPrefix(branch, "remotes/origin/")
-			}
-			if branch != "" && !strings.Contains(branch, "HEAD") {
-				logrus.Infof("Found branch containing tag %s: %s", tagName, branch)
-				return branch, nil
-			}
-		}
-	} else {
-		logrus.Warnf("Failed to get branches containing tag: %v", err)
-	}
-
-	// Method 2: Try to find the branch by examining commit message pattern
-	logrus.Info("Attempting to find source branch from tag creation commit")
-	cmd = exec.Command("git", "-C", gitPath, "show", "-s", "--format=%B", tagName)
-	msgOutput, err := cmd.Output()
-	if err == nil {
-		commitMsg := string(msgOutput)
-		// Look for common tag creation messages like "Merge branch 'release/1.0.0'"
-		if strings.Contains(commitMsg, "Merge branch '") {
-			startIdx := strings.Index(commitMsg, "Merge branch '") + len("Merge branch '")
-			endIdx := strings.Index(commitMsg[startIdx:], "'")
-			if endIdx > 0 {
-				branch := commitMsg[startIdx : startIdx+endIdx]
-				logrus.Infof("Found branch from tag commit message: %s", branch)
-				return branch, nil
-			}
-		}
-	} else {
-		logrus.Warnf("Failed to get tag commit message: %v", err)
-	}
-
-	// Method 3: Try to get the default branch if this is a release tag
-	if strings.HasPrefix(tagName, "v") || strings.Contains(tagName, "release") {
-		logrus.Info("Attempting to find default branch as tag appears to be a release tag")
-		cmd = exec.Command("git", "-C", gitPath, "remote", "show", "origin")
-		remoteOutput, err := cmd.Output()
-		if err == nil {
-			lines := strings.Split(string(remoteOutput), "\n")
-			for _, line := range lines {
-				if strings.Contains(line, "HEAD branch:") {
-					parts := strings.Split(line, ":")
-					if len(parts) > 1 {
-						defaultBranch := strings.TrimSpace(parts[1])
-						logrus.Infof("Using default branch for release tag: %s", defaultBranch)
-						return defaultBranch, nil
-					}
-				}
-			}
-		} else {
-			logrus.Warnf("Failed to get remote information: %v", err)
-		}
-	}
-
-	// Method 4: Use symbolic-ref to find the branch reference
-	cmd = exec.Command("git", "-C", gitPath, "symbolic-ref", "-q", "HEAD")
-	refOutput, err := cmd.Output()
-	if err == nil {
-		ref := strings.TrimSpace(string(refOutput))
-		if strings.HasPrefix(ref, "refs/heads/") {
-			branch := strings.TrimPrefix(ref, "refs/heads/")
-			logrus.Infof("Found branch using symbolic-ref: %s", branch)
-			return branch, nil
-		}
-	}
-
-	return "", fmt.Errorf("no source branch found for tag %s after trying multiple methods", tagName)
 }
 
 // Exec contains the main logic for executing commands related to Docker images and JFrog.
@@ -253,80 +163,39 @@ func Exec(ctx context.Context, args Args) error {
 
 	// If Git information is available, add it to the build info
 	logrus.Info("Setting Git Properties")
-	hasVCSInfo := args.RepoURL != "" && args.CommitSha != ""
+
+	// For tag builds, set DRONE_BRANCH to the tag value
+	branchOrTag := args.BranchName
+	if args.TagName != "" {
+		// If this is a tag build, use the tag name as the branch name
+		branchOrTag = args.TagName
+		logrus.WithFields(logrus.Fields{
+			"tag_name": args.TagName,
+		}).Info("Using tag as branch name for build info")
+	}
+
+	hasVCSInfo := args.RepoURL != "" && args.CommitSha != "" && (branchOrTag != "")
 
 	if hasVCSInfo {
-		// Determine VCS reference (branch or tag)
-		var vcsRef string
+		logrus.WithFields(logrus.Fields{
+			"repo_url":      args.RepoURL,
+			"commit_sha":    args.CommitSha,
+			"branch_or_tag": branchOrTag,
+		}).Info("Adding VCS information")
 
-		// Enhanced tag handling
+		// Set environment variable for the git command
 		if args.TagName != "" {
-			logrus.Infof("Processing tag build: %s", args.TagName)
-
-			// Try to get source branch with more robust approach
-			sourceBranch, err := getSourceBranchForTag(args.GitPath, args.TagName)
-			if err != nil {
-				logrus.Warnf("Could not determine source branch for tag: %v", err)
-				// If we can't get source branch, use tag name but ensure we capture it as a branch
-				vcsRef = "main" // Default to main if can't determine branch
-			} else {
-				vcsRef = sourceBranch
-				logrus.Infof("Found source branch for tag %s: %s", args.TagName, sourceBranch)
-			}
-
-			// Create VCS properties file
-			vcsPropsFile := filepath.Join(args.GitPath, "vcs_props.json")
-			vcsProps := map[string]string{
-				"vcs.branch": vcsRef,
-				"vcs.tag":    args.TagName,
-			}
-			vcsPropsBytes, _ := json.MarshalIndent(vcsProps, "", "  ")
-			if err := os.WriteFile(vcsPropsFile, vcsPropsBytes, 0644); err != nil {
-				logrus.Warnf("Failed to write VCS properties file: %v", err)
-			}
-
-			// Update Git config with branch info to help JFrog CLI
-			cmd := exec.Command("git", "-C", args.GitPath, "config", "--local", "build.vcs.branch", vcsRef)
-			if err := cmd.Run(); err != nil {
-				logrus.Warnf("Failed to set git config for branch: %v", err)
-			}
-
-			// Create a temporary reference to make sure git commands work properly
-			tempBranchName := fmt.Sprintf("temp-branch-for-tag-%s", args.TagName)
-			cmd = exec.Command("git", "-C", args.GitPath, "checkout", "-b", tempBranchName, args.TagName)
-			if err := cmd.Run(); err != nil {
-				logrus.Warnf("Failed to create temporary branch: %v", err)
-			}
-		} else if args.BranchName != "" {
-			vcsRef = args.BranchName
+			os.Setenv("DRONE_REPO_BRANCH", args.TagName)
 		}
 
-		logrus.WithFields(logrus.Fields{
-			"repo_url":    args.RepoURL,
-			"commit_sha":  args.CommitSha,
-			"branch_name": vcsRef, // Use resolved branch name
-			"tag_name":    args.TagName,
-		}).Info("VCS Information")
-
-		// Run git add-build command
 		cmdArgs = []string{"jfrog", "rt", "build-add-git", args.BuildName, args.BuildNumber, args.GitPath}
 		if err := runCommand(cmdArgs); err != nil {
 			logrus.Warnf("error executing jfrog rt build-add-git command: %v", err)
+		}
 
-			// Manually set VCS properties if automatic git info collection fails
-			logrus.Info("Fallback: Manually setting VCS properties")
-			setVcsProps := []string{
-				"jfrog", "rt", "build-update", args.BuildName, args.BuildNumber,
-				fmt.Sprintf("vcs.url=%s", args.RepoURL),
-				fmt.Sprintf("vcs.revision=%s", args.CommitSha),
-				fmt.Sprintf("vcs.branch=%s", vcsRef),
-			}
-			if args.TagName != "" {
-				setVcsProps = append(setVcsProps, fmt.Sprintf("vcs.tag=%s", args.TagName))
-			}
-			if err := runCommand(setVcsProps); err != nil {
-				logrus.Warnf("Failed to manually set VCS properties: %v", err)
-			}
+		// Restore original branch name if needed
+		if args.TagName != "" {
+			os.Setenv("DRONE_REPO_BRANCH", args.BranchName)
 		}
 	}
 
