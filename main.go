@@ -163,7 +163,7 @@ func Exec(ctx context.Context, args Args) error {
 
 	// If Git information is available, add it to the build info
 	logrus.Info("Setting Git Properties")
-	hasVCSInfo := args.RepoURL != "" && args.CommitSha != "" && (args.BranchName != "" || args.TagName != "")
+	hasVCSInfo := args.RepoURL != "" && args.CommitSha != ""
 	if hasVCSInfo {
 		branchValue := args.BranchName
 		if args.TagName != "" {
