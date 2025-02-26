@@ -230,75 +230,104 @@ func Exec(ctx context.Context, args Args) error {
 	return nil
 }
 
-// updateBuildInfoWithTag downloads the build info, updates the branch field with the tag name, and uploads it back.
 func updateBuildInfoWithTag(args Args, url, tagName string) error {
-	// Download the build info
-	tempFile, err := ioutil.TempFile("", "build-info-*.json")
-	if err != nil {
-		return fmt.Errorf("error creating temp file: %v", err)
-	}
-	defer os.Remove(tempFile.Name())
-	defer tempFile.Close()
+	// Download the build info using the build-export command instead of build-publish dry-run
+	buildInfoFile := "build-info.json"
 
-	// Command to download the build info
-	cmdArgs := []string{"jfrog", "rt", "build-publish", "--dry-run=true", "--url=" + url, args.BuildName, args.BuildNumber}
-	cmdArgs, err = setAuthParams(cmdArgs, args)
+	// Command to export the build info
+	cmdArgs := []string{"jfrog", "rt", "build-export", args.BuildName, args.BuildNumber, "--output=" + buildInfoFile, "--url=" + url}
+	cmdArgs, err := setAuthParams(cmdArgs, args)
 	if err != nil {
 		return fmt.Errorf("error setting auth parameters: %v", err)
 	}
 
-	// Run the command and capture the output to a file
-	output, err := runCommandAndCaptureOutput(cmdArgs)
-	if err != nil {
-		return fmt.Errorf("error downloading build info: %v", err)
+	// Run the export command
+	if err := runCommand(cmdArgs); err != nil {
+		return fmt.Errorf("error exporting build info: %v", err)
 	}
 
-	// Write the output to a file
-	if _, err := tempFile.WriteString(output); err != nil {
-		return fmt.Errorf("error writing build info to file: %v", err)
-	}
-	tempFile.Close()
-
-	// Read the file back
-	fileContent, err := ioutil.ReadFile(tempFile.Name())
+	// Read the exported build info file
+	fileContent, err := ioutil.ReadFile(buildInfoFile)
 	if err != nil {
 		return fmt.Errorf("error reading build info file: %v", err)
 	}
 
-	// Find and modify the JSON content
-	var buildInfo BuildInfo
-	if err := json.Unmarshal(fileContent, &buildInfo); err != nil {
+	// Parse the JSON into a map to handle unknown structure
+	var buildInfoMap map[string]interface{}
+	if err := json.Unmarshal(fileContent, &buildInfoMap); err != nil {
 		return fmt.Errorf("error parsing build info JSON: %v", err)
 	}
 
-	// Update the branch field in VCS info
-	for i := range buildInfo.VCS {
-		buildInfo.VCS[i].Branch = tagName
+	// Check if buildInfo and vcs fields exist
+	buildInfoObj, exists := buildInfoMap["buildInfo"]
+	if !exists {
+		return fmt.Errorf("buildInfo field not found in JSON")
 	}
 
-	// Write the modified JSON back to the file
-	updatedContent, err := json.MarshalIndent(buildInfo, "", "  ")
+	buildInfoData, ok := buildInfoObj.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("buildInfo is not an object")
+	}
+
+	// Access and update the vcs array if it exists
+	vcsArray, exists := buildInfoData["vcs"]
+	if exists {
+		vcsData, ok := vcsArray.([]interface{})
+		if ok {
+			// Update branch field in each vcs entry
+			for i, vcs := range vcsData {
+				vcsMap, ok := vcs.(map[string]interface{})
+				if ok {
+					vcsMap["branch"] = tagName
+					// Also ensure url and revision are set if they exist in args
+					if args.RepoURL != "" {
+						vcsMap["url"] = args.RepoURL
+					}
+					if args.CommitSha != "" {
+						vcsMap["revision"] = args.CommitSha
+					}
+					if args.CommitMessage != "" {
+						vcsMap["message"] = args.CommitMessage
+					}
+					vcsData[i] = vcsMap
+				}
+			}
+			buildInfoData["vcs"] = vcsData
+		} else {
+			// If vcs exists but is not an array, create a new vcs array
+			buildInfoData["vcs"] = []interface{}{
+				map[string]interface{}{
+					"url":      args.RepoURL,
+					"revision": args.CommitSha,
+					"branch":   tagName,
+					"message":  args.CommitMessage,
+				},
+			}
+		}
+	} else {
+		// If vcs doesn't exist, create it
+		buildInfoData["vcs"] = []interface{}{
+			map[string]interface{}{
+				"url":      args.RepoURL,
+				"revision": args.CommitSha,
+				"branch":   tagName,
+				"message":  args.CommitMessage,
+			},
+		}
+	}
+
+	// Write the modified buildInfo back to the file
+	updatedContent, err := json.MarshalIndent(buildInfoMap, "", "  ")
 	if err != nil {
 		return fmt.Errorf("error marshaling updated build info: %v", err)
 	}
 
-	if err := ioutil.WriteFile(tempFile.Name(), updatedContent, 0644); err != nil {
+	if err := ioutil.WriteFile(buildInfoFile, updatedContent, 0644); err != nil {
 		return fmt.Errorf("error writing updated build info to file: %v", err)
 	}
 
-	// Create a dedicated file for the build info since JFrog CLI expects a real file
-	buildInfoFile, err := os.Create("build-info.json")
-	if err != nil {
-		return fmt.Errorf("error creating build-info.json file: %v", err)
-	}
-	defer buildInfoFile.Close()
-
-	if _, err := buildInfoFile.Write(updatedContent); err != nil {
-		return fmt.Errorf("error writing to build-info.json file: %v", err)
-	}
-
 	// Import the updated build info
-	cmdArgs = []string{"jfrog", "rt", "build-import", "build-info.json", "--url=" + url}
+	cmdArgs = []string{"jfrog", "rt", "build-import", buildInfoFile, "--url=" + url}
 	cmdArgs, err = setAuthParams(cmdArgs, args)
 	if err != nil {
 		return fmt.Errorf("error setting auth parameters: %v", err)
