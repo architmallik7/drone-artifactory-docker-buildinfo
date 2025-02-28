@@ -165,32 +165,66 @@ func Exec(ctx context.Context, args Args) error {
 	logrus.Info("Setting Git Properties")
 	hasVCSInfo := args.RepoURL != "" && args.CommitSha != ""
 	if hasVCSInfo {
-		// Determine what type of build we have and what to log
+		// Determine what type of build we have
 		isTagBuild := args.TagName != ""
 
-		// Log appropriate fields based on build type
+		// Base fields for logging
 		fields := logrus.Fields{
 			"repo_url":   args.RepoURL,
 			"commit_sha": args.CommitSha,
 		}
 
+		// Create a temporary git config file for JFrog CLI if it's a tag build
 		if isTagBuild {
-			// For tag builds, only include tag information
 			fields["tag_name"] = args.TagName
 			logrus.WithFields(fields).Info("Adding tag VCS information")
+
+			// Create a temporary git properties file
+			gitConfigFile := "git.config.json"
+			gitConfig := map[string]interface{}{
+				"url":      args.RepoURL,
+				"revision": args.CommitSha,
+				"tag":      args.TagName,
+			}
+
+			// Write the git config to a file
+			configFile, err := os.Create(gitConfigFile)
+			if err != nil {
+				logrus.Errorf("error creating git config file: %v", err)
+			} else {
+				defer configFile.Close()
+				encoder := json.NewEncoder(configFile)
+				encoder.SetIndent("", "  ")
+				if err := encoder.Encode(gitConfig); err != nil {
+					logrus.Errorf("failed to encode git config to file: %v", err)
+				} else {
+					// Use the git config file with the build-collect-git command
+					cmdArgs = []string{"jfrog", "rt", "build-collect-git", args.BuildName, args.BuildNumber, gitConfigFile}
+					if err := runCommand(cmdArgs); err != nil {
+						logrus.Warnf("error executing jfrog rt build-collect-git command: %v", err)
+					}
+
+					// Clean up the temporary file
+					os.Remove(gitConfigFile)
+				}
+			}
 		} else if args.BranchName != "" {
-			// For branch builds, only include branch information if not empty
+			// For branch builds, use the standard build-add-git command
 			fields["branch"] = args.BranchName
 			logrus.WithFields(fields).Info("Adding branch VCS information")
+
+			cmdArgs = []string{"jfrog", "rt", "build-add-git", args.BuildName, args.BuildNumber, args.GitPath}
+			if err := runCommand(cmdArgs); err != nil {
+				logrus.Warnf("error executing jfrog rt build-add-git command: %v", err)
+			}
 		} else {
 			// If neither tag nor branch is available
 			logrus.WithFields(fields).Info("Adding basic VCS information")
-		}
 
-		// Execute the command with the appropriate Git information
-		cmdArgs = []string{"jfrog", "rt", "build-add-git", args.BuildName, args.BuildNumber, args.GitPath}
-		if err := runCommand(cmdArgs); err != nil {
-			logrus.Warnf("error executing jfrog rt build-add-git command: %v", err)
+			cmdArgs = []string{"jfrog", "rt", "build-add-git", args.BuildName, args.BuildNumber, args.GitPath}
+			if err := runCommand(cmdArgs); err != nil {
+				logrus.Warnf("error executing jfrog rt build-add-git command: %v", err)
+			}
 		}
 	}
 
