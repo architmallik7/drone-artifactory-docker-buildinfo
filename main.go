@@ -165,18 +165,29 @@ func Exec(ctx context.Context, args Args) error {
 	logrus.Info("Setting Git Properties")
 	hasVCSInfo := args.RepoURL != "" && args.CommitSha != ""
 	if hasVCSInfo {
-		branchValue := args.BranchName
-		if args.TagName != "" {
-			branchValue = args.TagName
-		}
+		// Determine what type of build we have and what to log
+		isTagBuild := args.TagName != ""
 
-		logrus.WithFields(logrus.Fields{
+		// Log appropriate fields based on build type
+		fields := logrus.Fields{
 			"repo_url":   args.RepoURL,
 			"commit_sha": args.CommitSha,
-			"branch":     branchValue,
-			"tag_name":   args.TagName,
-		}).Info("Adding VCS information")
+		}
 
+		if isTagBuild {
+			// For tag builds, only include tag information
+			fields["tag_name"] = args.TagName
+			logrus.WithFields(fields).Info("Adding tag VCS information")
+		} else if args.BranchName != "" {
+			// For branch builds, only include branch information if not empty
+			fields["branch"] = args.BranchName
+			logrus.WithFields(fields).Info("Adding branch VCS information")
+		} else {
+			// If neither tag nor branch is available
+			logrus.WithFields(fields).Info("Adding basic VCS information")
+		}
+
+		// Execute the command with the appropriate Git information
 		cmdArgs = []string{"jfrog", "rt", "build-add-git", args.BuildName, args.BuildNumber, args.GitPath}
 		if err := runCommand(cmdArgs); err != nil {
 			logrus.Warnf("error executing jfrog rt build-add-git command: %v", err)
